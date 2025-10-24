@@ -63,6 +63,7 @@ type Node struct {
 	// Layout: [timestamp:52][sequence:12]
 	state            atomic.Uint64
 	workerID         int64
+	workerBits       uint64
 	timeFunc         func() int64
 	epoch            int64
 	maxBackwardDrift time.Duration
@@ -87,6 +88,7 @@ func NewNode(workerID int64, opts ...NodeOption) (*Node, error) {
 
 	node := &Node{
 		workerID:         workerID,
+		workerBits:       uint64(workerID) << WorkerShift,
 		timeFunc:         func() int64 { return time.Now().UnixMilli() },
 		epoch:            DefaultEpoch,
 		maxBackwardDrift: defaultMaxBackwardDrift,
@@ -237,6 +239,8 @@ func (n *Node) Generate() (uint64, error) {
 
 		var newSeq uint64
 		var newTs int64
+		var newState uint64
+		var tsBits uint64
 
 		if now == oldTs {
 			// Same millisecond - increment sequence
@@ -258,21 +262,24 @@ func (n *Node) Generate() (uint64, error) {
 				continue
 			}
 			newTs = oldTs
+			newState = oldState + 1
+			tsBits = uint64(newTs) << TimestampShift
 		} else {
 			// New millisecond - reset sequence
 			newSeq = 0
 			newTs = now
+			newState = (uint64(newTs) << SequenceBits)
+			tsBits = uint64(newTs) << TimestampShift
 		}
 
-		// Pack new state: timestamp in upper 52 bits, sequence in lower 12 bits
-		newState := (uint64(newTs) << SequenceBits) | newSeq
+		if now != oldTs {
+			newState |= newSeq
+		}
 
 		// Try to update state atomically
 		if n.state.CompareAndSwap(oldState, newState) {
 			// Success! Build and return the ID
-			id := (uint64(newTs) << TimestampShift) |
-				(uint64(n.workerID) << WorkerShift) |
-				newSeq
+			id := tsBits | n.workerBits | newSeq
 			return id, nil
 		}
 		// CAS failed - another goroutine updated state, retry
@@ -340,7 +347,8 @@ func (n *Node) GenerateBatch(count int) ([]uint64, error) {
 		var startSeq uint64
 		var useTs int64
 
-		if now == oldTs {
+		sameMillisecond := now == oldTs
+		if sameMillisecond {
 			// Same millisecond - reserve from current sequence
 			available = int(uint64(MaxSequence) - oldSeq)
 			if available == 0 {
@@ -377,18 +385,22 @@ func (n *Node) GenerateBatch(count int) ([]uint64, error) {
 
 		// Calculate new state after reservation
 		endSeq := startSeq + uint64(toReserve) - 1
-		newState := (uint64(useTs) << SequenceBits) | (endSeq & uint64(MaxSequence))
+		var newState uint64
+		if sameMillisecond {
+			newState = oldState + uint64(toReserve)
+		} else {
+			newState = (uint64(useTs) << SequenceBits) | (endSeq & uint64(MaxSequence))
+		}
 
 		// Try to reserve the range atomically
 		if n.state.CompareAndSwap(oldState, newState) {
 			// Successfully reserved range [startSeq, endSeq] in timestamp useTs
 			// Generate IDs from this range
+			tsBits := uint64(useTs) << TimestampShift
+			base := tsBits | n.workerBits
 			for i := 0; i < toReserve; i++ {
 				seq := (startSeq + uint64(i)) & uint64(MaxSequence)
-				id := (uint64(useTs) << TimestampShift) |
-					(uint64(n.workerID) << WorkerShift) |
-					seq
-				ids = append(ids, id)
+				ids = append(ids, base|seq)
 			}
 		}
 		// If CAS failed, retry (another goroutine updated state)
