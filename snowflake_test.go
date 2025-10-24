@@ -41,7 +41,7 @@ func TestNewNodeValidWorkerID(t *testing.T) {
 
 // TestNewNodeWithOptions tests node creation with options
 func TestNewNodeWithOptions(t *testing.T) {
-	mockTime := customEpoch + 1000000 // 1 second after epoch
+	mockTime := DefaultEpoch + 1000000 // 1 second after epoch
 	mockTimeFunc := func() int64 { return mockTime }
 
 	node, err := NewNode(0, WithTimeFunc(mockTimeFunc))
@@ -63,6 +63,49 @@ func TestNewNodeWithOptions(t *testing.T) {
 	expectedTime := time.UnixMilli(mockTime)
 	if !extractedTime.Equal(expectedTime) {
 		t.Errorf("ExtractTimestamp() = %v, want %v", extractedTime, expectedTime)
+	}
+}
+
+// TestNewNodeWithEpoch verifies configurable epochs work throughout helpers.
+func TestNewNodeWithEpoch(t *testing.T) {
+	customEpoch := DefaultEpoch - 10_000 // 10 seconds earlier than default
+	mockTime := DefaultEpoch
+
+	node, err := NewNode(7, WithEpoch(customEpoch), WithTimeFunc(func() int64 { return mockTime }))
+	if err != nil {
+		t.Fatalf("NewNode() with WithEpoch failed: %v", err)
+	}
+
+	id, err := node.Generate()
+	if err != nil {
+		t.Fatalf("Generate() failed: %v", err)
+	}
+
+	ts, err := ExtractTimestampWithEpoch(id, customEpoch)
+	if err != nil {
+		t.Fatalf("ExtractTimestampWithEpoch() failed: %v", err)
+	}
+
+	expected := time.UnixMilli(mockTime)
+	if !ts.Equal(expected) {
+		t.Fatalf("ExtractTimestampWithEpoch() = %v, want %v", ts, expected)
+	}
+
+	if err := ValidateWithEpoch(id, customEpoch); err != nil {
+		t.Fatalf("ValidateWithEpoch() failed: %v", err)
+	}
+
+	_, workerID, sequence, err := DecomposeWithEpoch(id, customEpoch)
+	if err != nil {
+		t.Fatalf("DecomposeWithEpoch() failed: %v", err)
+	}
+
+	if workerID != 7 {
+		t.Fatalf("DecomposeWithEpoch() workerID = %d, want 7", workerID)
+	}
+
+	if sequence != 0 {
+		t.Fatalf("expected initial sequence 0, got %d", sequence)
 	}
 }
 
@@ -153,7 +196,7 @@ func TestGenerateMultipleIDs(t *testing.T) {
 
 // TestGenerateSequenceIncrement tests sequence counter behavior within same millisecond
 func TestGenerateSequenceIncrement(t *testing.T) {
-	currentTime := customEpoch + 1000 // 1000ms after epoch
+	currentTime := DefaultEpoch + 1000 // 1000ms after epoch
 	call := 0
 	mockTimeFunc := func() int64 {
 		// Return same time for first 20 calls, then increment
@@ -208,7 +251,7 @@ func TestGenerateSequenceIncrement(t *testing.T) {
 
 // TestGenerateClockBackwardsTolerance tests clock drift within acceptable range
 func TestGenerateClockBackwardsTolerance(t *testing.T) {
-	currentTime := customEpoch + 10000
+	currentTime := DefaultEpoch + 10000
 	call := 0
 	mockTimeFunc := func() int64 {
 		call++
@@ -252,7 +295,7 @@ func TestGenerateClockBackwardsTolerance(t *testing.T) {
 
 // TestGenerateClockBackwardsExcessive tests excessive clock drift
 func TestGenerateClockBackwardsExcessive(t *testing.T) {
-	currentTime := customEpoch + 10000
+	currentTime := DefaultEpoch + 10000
 	call := 0
 	mockTimeFunc := func() int64 {
 		call++
@@ -281,6 +324,30 @@ func TestGenerateClockBackwardsExcessive(t *testing.T) {
 	}
 	if !errors.Is(err, ErrClockBackwards) {
 		t.Errorf("Generate() error type = %v, want ErrClockBackwards", err)
+	}
+}
+
+// TestGenerateBeforeEpoch ensures we surface ErrTimeBeforeEpoch when the clock is before the configured epoch.
+func TestGenerateBeforeEpoch(t *testing.T) {
+	node, err := NewNode(1, WithTimeFunc(func() int64 { return DefaultEpoch - 1 }))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	_, err = node.Generate()
+	if err == nil {
+		t.Fatal("Generate() expected ErrTimeBeforeEpoch")
+	}
+	if !errors.Is(err, ErrTimeBeforeEpoch) {
+		t.Fatalf("Generate() error = %v, want ErrTimeBeforeEpoch", err)
+	}
+
+	_, err = node.GenerateBatch(5)
+	if err == nil {
+		t.Fatal("GenerateBatch() expected ErrTimeBeforeEpoch")
+	}
+	if !errors.Is(err, ErrTimeBeforeEpoch) {
+		t.Fatalf("GenerateBatch() error = %v, want ErrTimeBeforeEpoch", err)
 	}
 }
 
@@ -364,7 +431,7 @@ func TestGenerateBatchInvalidCount(t *testing.T) {
 
 // TestExtractTimestamp tests timestamp extraction
 func TestExtractTimestamp(t *testing.T) {
-	currentTime := customEpoch + 5000
+	currentTime := DefaultEpoch + 5000
 	mockTimeFunc := func() int64 { return currentTime }
 
 	node, err := NewNode(0, WithTimeFunc(mockTimeFunc))
@@ -450,7 +517,7 @@ func TestExtractWorkerIDInvalidID(t *testing.T) {
 
 // TestExtractSequence tests sequence extraction
 func TestExtractSequence(t *testing.T) {
-	currentTime := customEpoch + 5000
+	currentTime := DefaultEpoch + 5000
 	call := 0
 	mockTimeFunc := func() int64 {
 		if call < 5 {
@@ -613,7 +680,7 @@ func TestBitBoundaries(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ExtractTimestamp() at index %d failed: %v", i, err)
 		}
-		if ts.Before(time.UnixMilli(customEpoch)) {
+		if ts.Before(time.UnixMilli(DefaultEpoch)) {
 			t.Errorf("Index %d: timestamp before epoch", i)
 		}
 	}
@@ -775,7 +842,7 @@ func TestDecomposeInvalidID(t *testing.T) {
 
 // TestSequenceExhaustionRecovery tests recovery from sequence exhaustion
 func TestSequenceExhaustionRecovery(t *testing.T) {
-	currentTime := customEpoch + 5000
+	currentTime := DefaultEpoch + 5000
 	callCount := 0
 	mockTimeFunc := func() int64 {
 		callCount++
@@ -952,7 +1019,7 @@ func TestTimestampOverflowGenerate(t *testing.T) {
 	maxTimestamp := int64(-1 ^ (-1 << TimeBits))
 
 	// Create a time function that returns beyond the maximum
-	overflowTime := customEpoch + maxTimestamp + 10
+	overflowTime := DefaultEpoch + maxTimestamp + 10
 	overflowTimeFunc := func() int64 { return overflowTime }
 
 	node, err := NewNode(0, WithTimeFunc(overflowTimeFunc))
@@ -976,7 +1043,7 @@ func TestTimestampOverflowBatch(t *testing.T) {
 	maxTimestamp := int64(-1 ^ (-1 << TimeBits))
 
 	// Create a time function that returns beyond the maximum
-	overflowTime := customEpoch + maxTimestamp + 100
+	overflowTime := DefaultEpoch + maxTimestamp + 100
 	overflowTimeFunc := func() int64 { return overflowTime }
 
 	node, err := NewNode(1, WithTimeFunc(overflowTimeFunc))
@@ -1002,10 +1069,10 @@ func TestTimestampOverflowBatch(t *testing.T) {
 func TestExtractTimestampFuture(t *testing.T) {
 	// Build an ID with a timestamp 2 hours in the future (relative to now)
 	futureTime := time.Now().Add(2 * time.Hour).UnixMilli()
-	// Convert to the stored timestamp value (subtract customEpoch)
-	storedTs := futureTime - customEpoch
+	// Convert to the stored timestamp value (subtract DefaultEpoch)
+	storedTs := futureTime - DefaultEpoch
 	if storedTs <= 0 {
-		t.Skip("computed stored timestamp is non-positive; environment time may be before custom epoch")
+		t.Skip("computed stored timestamp is non-positive; environment time may be before configured epoch")
 	}
 
 	// Encode timestamp into an ID (worker and sequence zero)
@@ -1032,7 +1099,7 @@ func TestExtractTimestampFuture(t *testing.T) {
 // when the node's lastTimestamp is ahead of the current time by more than tolerance.
 func TestGenerateBatchClockBackwardsError(t *testing.T) {
 	// Start with a node using a stable time
-	currentTime := customEpoch + 10000
+	currentTime := DefaultEpoch + 10000
 	stableTimeFunc := func() int64 { return currentTime }
 
 	node, err := NewNode(2, WithTimeFunc(stableTimeFunc))
@@ -1066,52 +1133,6 @@ func TestGenerateBestEffortWorkerIDRange(t *testing.T) {
 	}
 	if workerID < 0 || workerID > MaxWorkerID {
 		t.Fatalf("generateBestEffortWorkerID() returned out-of-range workerID: %d (want 0..%d)", workerID, MaxWorkerID)
-	}
-}
-
-// TestWaitForNextMillisecondImmediateReturn verifies that when the node's time function
-// already reports a time greater than the provided lastTimestamp, waitForNextMillisecond
-// returns immediately with that time (no long sleep or blocking).
-func TestWaitForNextMillisecondImmediateReturn(t *testing.T) {
-	// Mock timeFunc to return a fixed time well after lastTimestamp.
-	fixedNow := customEpoch + 5000
-	n, err := NewNode(0, WithTimeFunc(func() int64 { return fixedNow }))
-	if err != nil {
-		t.Fatalf("NewNode() failed: %v", err)
-	}
-
-	lastTimestamp := int64(100) // much less than fixedNow - customEpoch
-	got := n.waitForNextMillisecond(lastTimestamp)
-	if got <= lastTimestamp {
-		t.Fatalf("waitForNextMillisecond() returned %d, want > %d", got, lastTimestamp)
-	}
-}
-
-// TestWaitForNextMillisecondPolling simulates a case where the first few calls to timeFunc
-// return a value <= lastTimestamp and subsequent calls advance the time, exercising the polling loop.
-func TestWaitForNextMillisecondPolling(t *testing.T) {
-	call := 0
-	// First call returns a time equal to lastTimestamp, second (and later) calls return lastTimestamp+2
-	lastTimestamp := int64(1000)
-	n, err := NewNode(1, WithTimeFunc(func() int64 {
-		call++
-		if call == 1 {
-			// return a timestamp that makes now == lastTimestamp
-			return customEpoch + lastTimestamp
-		}
-		// return a timestamp that's greater so the loop exits
-		return customEpoch + lastTimestamp + 2
-	}))
-	if err != nil {
-		t.Fatalf("NewNode() failed: %v", err)
-	}
-
-	got := n.waitForNextMillisecond(lastTimestamp)
-	if got <= lastTimestamp {
-		t.Fatalf("waitForNextMillisecond() polling returned %d, want > %d", got, lastTimestamp)
-	}
-	if call < 2 {
-		t.Fatalf("expected waitForNextMillisecond to call timeFunc multiple times, got %d calls", call)
 	}
 }
 
@@ -1165,7 +1186,7 @@ func TestExtractWithMinimalValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExtractTimestamp() failed: %v", err)
 	}
-	expectedTime := time.UnixMilli(minTimestamp + customEpoch)
+	expectedTime := time.UnixMilli(minTimestamp + DefaultEpoch)
 	if !ts.Equal(expectedTime) {
 		t.Fatalf("ExtractTimestamp() = %v, want %v", ts, expectedTime)
 	}
@@ -1219,7 +1240,7 @@ func TestSignBitAlwaysZero(t *testing.T) {
 // TestSequenceExhaustionInSameMillisecond attempts to generate more IDs than the sequence
 // can hold in a single millisecond, triggering the wait-for-next-millisecond logic.
 func TestSequenceExhaustionInSameMillisecond(t *testing.T) {
-	currentTime := customEpoch + 50000
+	currentTime := DefaultEpoch + 50000
 	callCount := 0
 	n, err := NewNode(7, WithTimeFunc(func() int64 {
 		callCount++
@@ -1266,7 +1287,7 @@ func TestSequenceExhaustionInSameMillisecond(t *testing.T) {
 // TestGenerateBatchExactSequenceBoundary generates a batch of exactly MaxSequence+1 IDs,
 // which should span exactly two milliseconds (first batch exhausts sequence, second starts fresh).
 func TestGenerateBatchExactSequenceBoundary(t *testing.T) {
-	currentTime := customEpoch + 40000
+	currentTime := DefaultEpoch + 40000
 	callCount := 0
 	n, err := NewNode(15, WithTimeFunc(func() int64 {
 		callCount++
@@ -1382,7 +1403,7 @@ func TestIDStructureIntegrity(t *testing.T) {
 		sequence, _ := ExtractSequence(id)
 
 		// Reconstruct ID from components
-		reconstructed := (uint64(ts.UnixMilli()-customEpoch) << TimestampShift) |
+		reconstructed := (uint64(ts.UnixMilli()-DefaultEpoch) << TimestampShift) |
 			(uint64(workerID) << WorkerShift) |
 			uint64(sequence)
 
@@ -1402,7 +1423,7 @@ func TestIDStructureIntegrity(t *testing.T) {
 		if extractedSeq != sequence {
 			t.Fatalf("Iteration %d: sequence bit extraction failed: %d != %d", i, extractedSeq, sequence)
 		}
-		if extractedTs != ts.UnixMilli()-customEpoch {
+		if extractedTs != ts.UnixMilli()-DefaultEpoch {
 			t.Fatalf("Iteration %d: timestamp bit extraction failed", i)
 		}
 	}
@@ -1486,7 +1507,7 @@ func TestNewNodeBoundaryWorkerIDs(t *testing.T) {
 // TestGenerateSequenceRolloverMultipleTimes tests that sequence correctly resets
 // multiple times across different milliseconds.
 func TestGenerateSequenceRolloverMultipleTimes(t *testing.T) {
-	timeMs := customEpoch + 30000
+	timeMs := DefaultEpoch + 30000
 	callCount := 0
 	n, err := NewNode(3, WithTimeFunc(func() int64 {
 		callCount++
