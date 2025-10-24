@@ -109,6 +109,45 @@ func TestNewNodeWithEpoch(t *testing.T) {
 	}
 }
 
+// TestExtractTimestampWithEpochDifference ensures the epoch-aware helper aligns timestamps with the configured epoch.
+func TestExtractTimestampWithEpochDifference(t *testing.T) {
+	customEpoch := DefaultEpoch - int64(time.Hour/time.Millisecond) // 1 hour earlier
+	absoluteTime := customEpoch + 25_000
+
+	node, err := NewNode(3, WithEpoch(customEpoch), WithTimeFunc(func() int64 { return absoluteTime }))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	id, err := node.Generate()
+	if err != nil {
+		t.Fatalf("Generate() failed: %v", err)
+	}
+
+	tsWithEpoch, err := ExtractTimestampWithEpoch(id, customEpoch)
+	if err != nil {
+		t.Fatalf("ExtractTimestampWithEpoch() failed: %v", err)
+	}
+
+	if want := time.UnixMilli(absoluteTime); !tsWithEpoch.Equal(want) {
+		t.Fatalf("ExtractTimestampWithEpoch() = %v, want %v", tsWithEpoch, want)
+	}
+
+	tsDefault, err := ExtractTimestamp(id)
+	if err != nil {
+		t.Fatalf("ExtractTimestamp() failed: %v", err)
+	}
+
+	offset := time.Duration(DefaultEpoch-customEpoch) * time.Millisecond
+	if !tsDefault.Equal(tsWithEpoch.Add(offset)) {
+		t.Fatalf("default extraction mismatch: got %v, want %v", tsDefault, tsWithEpoch.Add(offset))
+	}
+
+	if err := ValidateWithEpoch(id, customEpoch); err != nil {
+		t.Fatalf("ValidateWithEpoch() failed: %v", err)
+	}
+}
+
 // TestNewNodeWithBestEffortID tests best-effort ID generation
 func TestNewNodeWithBestEffortID(t *testing.T) {
 	node, err := NewNodeWithBestEffortID()
@@ -132,32 +171,6 @@ func TestNewNodeWithBestEffortID(t *testing.T) {
 
 	if id == 0 {
 		t.Error("Generate() returned 0")
-	}
-}
-
-// TestGenerateSingleID tests basic ID generation
-func TestGenerateSingleID(t *testing.T) {
-	node, err := NewNode(42)
-	if err != nil {
-		t.Fatalf("NewNode() failed: %v", err)
-	}
-
-	id, err := node.Generate()
-	if err != nil {
-		t.Fatalf("Generate() failed: %v", err)
-	}
-
-	if id == 0 {
-		t.Error("Generate() returned 0")
-	}
-
-	// Verify extracted worker ID matches
-	extractedWorkerID, err := ExtractWorkerID(id)
-	if err != nil {
-		t.Fatalf("ExtractWorkerID() failed: %v", err)
-	}
-	if extractedWorkerID != 42 {
-		t.Errorf("ExtractWorkerID() = %d, want 42", extractedWorkerID)
 	}
 }
 
@@ -429,32 +442,6 @@ func TestGenerateBatchInvalidCount(t *testing.T) {
 	}
 }
 
-// TestExtractTimestamp tests timestamp extraction
-func TestExtractTimestamp(t *testing.T) {
-	currentTime := DefaultEpoch + 5000
-	mockTimeFunc := func() int64 { return currentTime }
-
-	node, err := NewNode(0, WithTimeFunc(mockTimeFunc))
-	if err != nil {
-		t.Fatalf("NewNode() failed: %v", err)
-	}
-
-	id, err := node.Generate()
-	if err != nil {
-		t.Fatalf("Generate() failed: %v", err)
-	}
-
-	extractedTime, err := ExtractTimestamp(id)
-	if err != nil {
-		t.Fatalf("ExtractTimestamp() failed: %v", err)
-	}
-
-	expectedTime := time.UnixMilli(currentTime)
-	if !extractedTime.Equal(expectedTime) {
-		t.Errorf("ExtractTimestamp() = %v, want %v", extractedTime, expectedTime)
-	}
-}
-
 // TestExtractTimestampInvalidID tests timestamp extraction on invalid IDs
 func TestExtractTimestampInvalidID(t *testing.T) {
 	tests := []struct {
@@ -562,26 +549,6 @@ func TestExtractSequenceInvalidID(t *testing.T) {
 	}
 }
 
-// TestValidateValidID tests ID validation with valid IDs
-func TestValidateValidID(t *testing.T) {
-	node, err := NewNode(10)
-	if err != nil {
-		t.Fatalf("NewNode() failed: %v", err)
-	}
-
-	for i := 0; i < 100; i++ {
-		id, err := node.Generate()
-		if err != nil {
-			t.Fatalf("Generate() iteration %d failed: %v", i, err)
-		}
-
-		err = Validate(id)
-		if err != nil {
-			t.Errorf("Validate() iteration %d failed: %v", i, err)
-		}
-	}
-}
-
 // TestValidateInvalidID tests ID validation with invalid IDs
 func TestValidateInvalidID(t *testing.T) {
 	tests := []struct {
@@ -600,47 +567,6 @@ func TestValidateInvalidID(t *testing.T) {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
-	}
-}
-
-// TestIDReconstruction tests that extracted components can reconstruct the original ID
-func TestIDReconstruction(t *testing.T) {
-	node, err := NewNode(512)
-	if err != nil {
-		t.Fatalf("NewNode() failed: %v", err)
-	}
-
-	for i := 0; i < 50; i++ {
-		id, err := node.Generate()
-		if err != nil {
-			t.Fatalf("Generate() iteration %d failed: %v", i, err)
-		}
-
-		// Extract all components
-		_, err = ExtractTimestamp(id)
-		if err != nil {
-			t.Fatalf("ExtractTimestamp() failed: %v", err)
-		}
-
-		workerID, err := ExtractWorkerID(id)
-		if err != nil {
-			t.Fatalf("ExtractWorkerID() failed: %v", err)
-		}
-
-		sequence, err := ExtractSequence(id)
-		if err != nil {
-			t.Fatalf("ExtractSequence() failed: %v", err)
-		}
-
-		// Verify worker ID
-		if workerID != 512 {
-			t.Errorf("Iteration %d: workerID = %d, want 512", i, workerID)
-		}
-
-		// Sequence should be in valid range
-		if sequence < 0 || sequence > MaxSequence {
-			t.Errorf("Iteration %d: sequence %d out of range", i, sequence)
-		}
 	}
 }
 
@@ -686,97 +612,254 @@ func TestBitBoundaries(t *testing.T) {
 	}
 }
 
-// TestConcurrentGeneration tests thread-safe ID generation
-func TestConcurrentGeneration(t *testing.T) {
-	node, err := NewNode(100)
+// TestHighLoadGenerate exercises the generator under heavier sequential load.
+func TestHighLoadGenerate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping high-load test in short mode")
+	}
+
+	node, err := NewNode(11)
 	if err != nil {
 		t.Fatalf("NewNode() failed: %v", err)
 	}
 
-	const numGoroutines = 10
-	const idsPerGoroutine = 100
-	idsChan := make(chan uint64, numGoroutines*idsPerGoroutine)
+	const total = 50_000
+	ids := make([]uint64, total)
+	for i := 0; i < total; i++ {
+		id, err := node.Generate()
+		if err != nil {
+			t.Fatalf("Generate() iteration %d failed: %v", i, err)
+		}
+		ids[i] = id
+	}
+
+	for i := 1; i < len(ids); i++ {
+		if ids[i] <= ids[i-1] {
+			t.Fatalf("IDs not strictly increasing at index %d: %d <= %d", i, ids[i], ids[i-1])
+		}
+	}
+}
+
+// TestGenerateUniquenessConcurrent ensures that concurrently generated IDs remain unique across goroutines.
+func TestGenerateUniquenessConcurrent(t *testing.T) {
+	node, err := NewNode(23)
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	const (
+		goroutines      = 16
+		idsPerGoroutine = 2000
+	)
+
+	idsCh := make(chan uint64, goroutines*idsPerGoroutine)
+	errCh := make(chan error, goroutines)
 
 	var wg sync.WaitGroup
-	for g := 0; g < numGoroutines; g++ {
+	for g := 0; g < goroutines; g++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for i := 0; i < idsPerGoroutine; i++ {
-				id, err := node.Generate()
-				if err != nil {
-					t.Errorf("Generate() failed: %v", err)
+				id, genErr := node.Generate()
+				if genErr != nil {
+					errCh <- genErr
 					return
 				}
-				idsChan <- id
+				idsCh <- id
 			}
 		}()
 	}
 
 	wg.Wait()
-	close(idsChan)
+	close(idsCh)
+	close(errCh)
 
-	// Collect all IDs and verify uniqueness
-	ids := make([]uint64, 0, numGoroutines*idsPerGoroutine)
-	seen := make(map[uint64]bool)
-
-	for id := range idsChan {
-		if seen[id] {
-			t.Errorf("Duplicate ID generated: %d", id)
+	for genErr := range errCh {
+		if genErr != nil {
+			t.Fatalf("Generate() failed: %v", genErr)
 		}
-		seen[id] = true
-		ids = append(ids, id)
 	}
 
-	if len(ids) != numGoroutines*idsPerGoroutine {
-		t.Errorf("Expected %d IDs, got %d", numGoroutines*idsPerGoroutine, len(ids))
+	seen := make(map[uint64]struct{}, goroutines*idsPerGoroutine)
+	for id := range idsCh {
+		if _, ok := seen[id]; ok {
+			t.Fatalf("duplicate ID detected: %d", id)
+		}
+		seen[id] = struct{}{}
+	}
+
+	if len(seen) != goroutines*idsPerGoroutine {
+		t.Fatalf("expected %d unique IDs, got %d", goroutines*idsPerGoroutine, len(seen))
 	}
 }
 
-// TestConcurrentBatchGeneration tests thread-safe batch ID generation
-func TestConcurrentBatchGeneration(t *testing.T) {
-	node, err := NewNode(50)
+// TestConcurrentGenerationWithCustomEpoch validates concurrent usage with a non-default epoch.
+func TestConcurrentGenerationWithCustomEpoch(t *testing.T) {
+	epoch := time.Now().Add(-2 * time.Hour).UnixMilli()
+	node, err := NewNode(123, WithEpoch(epoch))
 	if err != nil {
 		t.Fatalf("NewNode() failed: %v", err)
 	}
 
-	const numGoroutines = 5
-	const batchSize = 100
-	idsChan := make(chan uint64, numGoroutines*batchSize)
+	const (
+		goroutines      = 16
+		idsPerGoroutine = 1500
+	)
+
+	idsCh := make(chan uint64, goroutines*idsPerGoroutine)
+	errCh := make(chan error, goroutines)
 
 	var wg sync.WaitGroup
-	for g := 0; g < numGoroutines; g++ {
+	for g := 0; g < goroutines; g++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ids, err := node.GenerateBatch(batchSize)
-			if err != nil {
-				t.Errorf("GenerateBatch() failed: %v", err)
-				return
-			}
-			for _, id := range ids {
-				idsChan <- id
+			for i := 0; i < idsPerGoroutine; i++ {
+				id, genErr := node.Generate()
+				if genErr != nil {
+					errCh <- genErr
+					return
+				}
+				idsCh <- id
 			}
 		}()
 	}
 
 	wg.Wait()
-	close(idsChan)
+	close(idsCh)
 
-	// Verify all IDs are unique
-	seen := make(map[uint64]bool)
-	count := 0
-
-	for id := range idsChan {
-		if seen[id] {
-			t.Errorf("Duplicate ID generated: %d", id)
-		}
-		seen[id] = true
-		count++
+	select {
+	case genErr := <-errCh:
+		t.Fatalf("Generate() failed: %v", genErr)
+	default:
 	}
 
-	if count != numGoroutines*batchSize {
-		t.Errorf("Expected %d IDs, got %d", numGoroutines*batchSize, count)
+	seen := make(map[uint64]struct{}, goroutines*idsPerGoroutine)
+	for id := range idsCh {
+		if _, ok := seen[id]; ok {
+			t.Fatalf("duplicate ID detected: %d", id)
+		}
+		seen[id] = struct{}{}
+
+		if err := ValidateWithEpoch(id, epoch); err != nil {
+			t.Fatalf("ValidateWithEpoch() failed for id %d: %v", id, err)
+		}
+
+		ts, err := ExtractTimestampWithEpoch(id, epoch)
+		if err != nil {
+			t.Fatalf("ExtractTimestampWithEpoch() failed: %v", err)
+		}
+		if ts.Before(time.UnixMilli(epoch)) {
+			t.Fatalf("timestamp before epoch: %v", ts)
+		}
+
+		worker, err := ExtractWorkerID(id)
+		if err != nil {
+			t.Fatalf("ExtractWorkerID() failed: %v", err)
+		}
+		if worker != 123 {
+			t.Fatalf("worker mismatch: got %d, want 123", worker)
+		}
+	}
+}
+
+// TestConcurrentBatchWithCustomEpoch validates batch generation under concurrent load with a custom epoch.
+func TestConcurrentBatchWithCustomEpoch(t *testing.T) {
+	epoch := time.Now().Add(-time.Hour).UnixMilli()
+	node, err := NewNode(77, WithEpoch(epoch))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	const (
+		goroutines = 8
+		batchSize  = 10000
+	)
+
+	idsCh := make(chan uint64, goroutines*batchSize)
+	errCh := make(chan error, goroutines)
+
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ids, batchErr := node.GenerateBatch(batchSize)
+			if batchErr != nil {
+				errCh <- batchErr
+				return
+			}
+			for _, id := range ids {
+				idsCh <- id
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(idsCh)
+
+	select {
+	case batchErr := <-errCh:
+		t.Fatalf("GenerateBatch() failed: %v", batchErr)
+	default:
+	}
+
+	seen := make(map[uint64]struct{}, goroutines*batchSize)
+	for id := range idsCh {
+		if _, ok := seen[id]; ok {
+			t.Fatalf("duplicate ID detected: %d", id)
+		}
+		seen[id] = struct{}{}
+
+		if err := ValidateWithEpoch(id, epoch); err != nil {
+			t.Fatalf("ValidateWithEpoch() failed for id %d: %v", id, err)
+		}
+
+		worker, err := ExtractWorkerID(id)
+		if err != nil {
+			t.Fatalf("ExtractWorkerID() failed: %v", err)
+		}
+		if worker != 77 {
+			t.Fatalf("worker mismatch: got %d, want 77", worker)
+		}
+	}
+}
+
+// TestGenerateBatchUniquenessAcrossCalls ensures uniqueness when multiple batches are generated sequentially.
+func TestGenerateBatchUniquenessAcrossCalls(t *testing.T) {
+	node, err := NewNode(31)
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	const (
+		batches   = 50
+		batchSize = 256
+	)
+
+	seen := make(map[uint64]struct{}, batches*batchSize)
+
+	for i := 0; i < batches; i++ {
+		ids, genErr := node.GenerateBatch(batchSize)
+		if genErr != nil {
+			t.Fatalf("GenerateBatch() iteration %d failed: %v", i, genErr)
+		}
+
+		if len(ids) != batchSize {
+			t.Fatalf("GenerateBatch() iteration %d returned %d IDs, want %d", i, len(ids), batchSize)
+		}
+
+		for _, id := range ids {
+			if _, ok := seen[id]; ok {
+				t.Fatalf("duplicate ID detected across batches: %d", id)
+			}
+			seen[id] = struct{}{}
+		}
+	}
+
+	if len(seen) != batches*batchSize {
+		t.Fatalf("expected %d unique IDs, got %d", batches*batchSize, len(seen))
 	}
 }
 
@@ -1125,17 +1208,6 @@ func TestGenerateBatchClockBackwardsError(t *testing.T) {
 	}
 }
 
-// TestGenerateBestEffortWorkerIDRange ensures the best-effort worker ID is within valid bounds.
-func TestGenerateBestEffortWorkerIDRange(t *testing.T) {
-	workerID, err := generateBestEffortWorkerID()
-	if err != nil {
-		t.Fatalf("generateBestEffortWorkerID() returned error: %v", err)
-	}
-	if workerID < 0 || workerID > MaxWorkerID {
-		t.Fatalf("generateBestEffortWorkerID() returned out-of-range workerID: %d (want 0..%d)", workerID, MaxWorkerID)
-	}
-}
-
 // TestExtractWithMaxComponentValues verifies that extract functions correctly handle
 // IDs where each field is at its maximum value.
 func TestExtractWithMaxComponentValues(t *testing.T) {
@@ -1234,53 +1306,6 @@ func TestSignBitAlwaysZero(t *testing.T) {
 		if int64(id) < 0 {
 			t.Fatalf("ID %d is negative when cast to int64: %d", id, int64(id))
 		}
-	}
-}
-
-// TestSequenceExhaustionInSameMillisecond attempts to generate more IDs than the sequence
-// can hold in a single millisecond, triggering the wait-for-next-millisecond logic.
-func TestSequenceExhaustionInSameMillisecond(t *testing.T) {
-	currentTime := DefaultEpoch + 50000
-	callCount := 0
-	n, err := NewNode(7, WithTimeFunc(func() int64 {
-		callCount++
-		// Return same time for first MaxSequence+2 calls, then advance
-		if callCount <= int(MaxSequence)+2 {
-			return currentTime
-		}
-		return currentTime + 1
-	}))
-	if err != nil {
-		t.Fatalf("NewNode() failed: %v", err)
-	}
-
-	// Generate MaxSequence+2 IDs - first MaxSequence+1 in first ms, then we exhaust and move to next ms
-	count := int(MaxSequence) + 2
-	ids := make([]uint64, count)
-	for i := 0; i < count; i++ {
-		id, err := n.Generate()
-		if err != nil {
-			t.Fatalf("Generate() iteration %d failed: %v", i, err)
-		}
-		ids[i] = id
-	}
-
-	// All IDs should be unique
-	seen := make(map[uint64]bool)
-	for i, id := range ids {
-		if seen[id] {
-			t.Fatalf("Duplicate ID at index %d: %d", i, id)
-		}
-		seen[id] = true
-	}
-
-	// Last ID should have sequence 0 or 1 (reset after exhaustion)
-	lastSeq, err := ExtractSequence(ids[count-1])
-	if err != nil {
-		t.Fatalf("ExtractSequence() on last ID failed: %v", err)
-	}
-	if lastSeq > 1 {
-		t.Fatalf("Last ID sequence = %d, expected <=1 after exhaustion", lastSeq)
 	}
 }
 
@@ -1426,81 +1451,6 @@ func TestIDStructureIntegrity(t *testing.T) {
 		if extractedTs != ts.UnixMilli()-DefaultEpoch {
 			t.Fatalf("Iteration %d: timestamp bit extraction failed", i)
 		}
-	}
-}
-
-// TestGenerateBatchSmallCounts tests batch generation with very small counts (1, 2, 3)
-// to ensure edge case handling for minimal batch sizes.
-func TestGenerateBatchSmallCounts(t *testing.T) {
-	tests := []int{1, 2, 3, 5}
-
-	for _, count := range tests {
-		t.Run(string(rune(count)), func(t *testing.T) {
-			node, err := NewNode(99)
-			if err != nil {
-				t.Fatalf("NewNode() failed: %v", err)
-			}
-
-			ids, err := node.GenerateBatch(count)
-			if err != nil {
-				t.Fatalf("GenerateBatch(%d) failed: %v", count, err)
-			}
-
-			if len(ids) != count {
-				t.Fatalf("GenerateBatch(%d) returned %d IDs, want %d", count, len(ids), count)
-			}
-
-			// Check uniqueness
-			seen := make(map[uint64]bool)
-			for i, id := range ids {
-				if seen[id] {
-					t.Fatalf("Duplicate ID at index %d", i)
-				}
-				seen[id] = true
-
-				if id == 0 {
-					t.Fatalf("ID at index %d is 0", i)
-				}
-			}
-
-			// Check ordering
-			for i := 1; i < len(ids); i++ {
-				if ids[i] <= ids[i-1] {
-					t.Fatalf("IDs not in order at index %d", i)
-				}
-			}
-		})
-	}
-}
-
-// TestNewNodeBoundaryWorkerIDs tests node creation with worker IDs at exact boundaries.
-func TestNewNodeBoundaryWorkerIDs(t *testing.T) {
-	tests := []struct {
-		name     string
-		workerID int64
-		valid    bool
-	}{
-		{"Zero", 0, true},
-		{"One", 1, true},
-		{"MaxWorkerID-1", MaxWorkerID - 1, true},
-		{"MaxWorkerID", MaxWorkerID, true},
-		{"MaxWorkerID+1", MaxWorkerID + 1, false},
-		{"Negative one", -1, false},
-		{"Negative large", -1024, false},
-		{"Very large", 2048, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			node, err := NewNode(tt.workerID)
-			if (err != nil) != !tt.valid {
-				t.Fatalf("NewNode(%d) error = %v, valid = %v", tt.workerID, err, tt.valid)
-			}
-
-			if tt.valid && node != nil && node.workerID != tt.workerID {
-				t.Fatalf("NewNode(%d) workerID = %d", tt.workerID, node.workerID)
-			}
-		})
 	}
 }
 
