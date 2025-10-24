@@ -2,6 +2,7 @@ package snowflake
 
 import (
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -204,6 +205,36 @@ func TestGenerateMultipleIDs(t *testing.T) {
 		if ids[i] < ids[i-1] {
 			t.Errorf("IDs not in order: ids[%d]=%d < ids[%d]=%d", i, ids[i], i-1, ids[i-1])
 		}
+	}
+}
+
+// TestGenerateString ensures string output matches numeric generation semantics.
+func TestGenerateString(t *testing.T) {
+	node, err := NewNode(2)
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	str, err := node.GenerateString()
+	if err != nil {
+		t.Fatalf("GenerateString() failed: %v", err)
+	}
+
+	if str == "" {
+		t.Fatalf("GenerateString() returned empty string")
+	}
+
+	idFromStr, err := ParseString(str)
+	if err != nil {
+		t.Fatalf("ParseString() failed: %v", err)
+	}
+
+	if err := Validate(idFromStr); err != nil {
+		t.Fatalf("Validate() failed for parsed ID: %v", err)
+	}
+
+	if parsedUint, err := strconv.ParseUint(str, 10, 64); err != nil || parsedUint != idFromStr {
+		t.Fatalf("string mismatch: parsedUint=%d err=%v", parsedUint, err)
 	}
 }
 
@@ -485,6 +516,48 @@ func TestGenerateBatchValid(t *testing.T) {
 	}
 }
 
+// TestGenerateBatchStrings verifies the string batch helper mirrors numeric behaviour.
+func TestGenerateBatchStrings(t *testing.T) {
+	node, err := NewNode(55)
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	count := 64
+	stringsBatch, err := node.GenerateBatchStrings(count)
+	if err != nil {
+		t.Fatalf("GenerateBatchStrings() failed: %v", err)
+	}
+
+	if len(stringsBatch) != count {
+		t.Fatalf("GenerateBatchStrings() returned %d strings, want %d", len(stringsBatch), count)
+	}
+
+	seen := make(map[uint64]struct{}, count)
+	for i, strID := range stringsBatch {
+		parsed, parseErr := ParseString(strID)
+		if parseErr != nil {
+			t.Fatalf("ParseString() at index %d failed: %v", i, parseErr)
+		}
+		if _, ok := seen[parsed]; ok {
+			t.Fatalf("duplicate ID detected at index %d", i)
+		}
+		seen[parsed] = struct{}{}
+	}
+}
+
+// TestGenerateBatchStringsInvalidCount ensures invalid counts propagate errors.
+func TestGenerateBatchStringsInvalidCount(t *testing.T) {
+	node, err := NewNode(0)
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	if ids, err := node.GenerateBatchStrings(0); err == nil || ids != nil {
+		t.Fatalf("GenerateBatchStrings(0) expected error, got ids=%v err=%v", ids, err)
+	}
+}
+
 // TestGenerateBatchInvalidCount tests batch generation with invalid counts
 func TestGenerateBatchInvalidCount(t *testing.T) {
 	node, err := NewNode(0)
@@ -532,6 +605,67 @@ func TestExtractTimestampInvalidID(t *testing.T) {
 				t.Errorf("ExtractTimestamp() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestParseString verifies decimal parsing integrates with validation.
+func TestParseString(t *testing.T) {
+	node, err := NewNode(7, WithTimeFunc(func() int64 { return DefaultEpoch + 1234 }))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	id, err := node.Generate()
+	if err != nil {
+		t.Fatalf("Generate() failed: %v", err)
+	}
+
+	str := strconv.FormatUint(id, 10)
+	parsed, err := ParseString(str)
+	if err != nil {
+		t.Fatalf("ParseString() failed: %v", err)
+	}
+	if parsed != id {
+		t.Fatalf("ParseString() mismatch: got %d, want %d", parsed, id)
+	}
+}
+
+// TestParseStringWithEpoch verifies parsing against a custom epoch.
+func TestParseStringWithEpoch(t *testing.T) {
+	customEpoch := DefaultEpoch - 5000
+	mockTime := customEpoch + 2500
+	node, err := NewNode(9, WithEpoch(customEpoch), WithTimeFunc(func() int64 { return mockTime }))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	id, err := node.Generate()
+	if err != nil {
+		t.Fatalf("Generate() failed: %v", err)
+	}
+
+	str := strconv.FormatUint(id, 10)
+	parsed, err := ParseStringWithEpoch(str, customEpoch)
+	if err != nil {
+		t.Fatalf("ParseStringWithEpoch() failed: %v", err)
+	}
+	if parsed != id {
+		t.Fatalf("ParseStringWithEpoch() mismatch: got %d, want %d", parsed, id)
+	}
+}
+
+// TestParseStringInvalid ensures invalid inputs are rejected.
+func TestParseStringInvalid(t *testing.T) {
+	if _, err := ParseString("not-a-number"); err == nil {
+		t.Fatal("ParseString() expected error for non-numeric input")
+	}
+
+	if _, err := ParseString("0"); err == nil || !errors.Is(err, ErrInvalidSnowflakeID) {
+		t.Fatalf("ParseString() expect ErrInvalidSnowflakeID for zero, got %v", err)
+	}
+
+	if _, err := ParseString(" "); err == nil || !errors.Is(err, ErrInvalidSnowflakeID) {
+		t.Fatalf("ParseString() expect ErrInvalidSnowflakeID for blank string, got %v", err)
 	}
 }
 

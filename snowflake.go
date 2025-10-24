@@ -9,6 +9,8 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -277,6 +279,15 @@ func (n *Node) Generate() (uint64, error) {
 	}
 }
 
+// GenerateString returns a decimal string representation of a generated Snowflake ID.
+func (n *Node) GenerateString() (string, error) {
+	id, err := n.Generate()
+	if err != nil {
+		return "", err
+	}
+	return strconv.FormatUint(id, 10), nil
+}
+
 // GenerateBatch generates multiple Snowflake IDs using lock-free atomic range reservation.
 // This atomically reserves a range of sequence numbers and generates IDs from that range.
 //
@@ -384,6 +395,20 @@ func (n *Node) GenerateBatch(count int) ([]uint64, error) {
 	}
 
 	return ids, nil
+}
+
+// GenerateBatchStrings returns decimal string representations for a batch of IDs.
+func (n *Node) GenerateBatchStrings(count int) ([]string, error) {
+	ids, err := n.GenerateBatch(count)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]string, len(ids))
+	for i, id := range ids {
+		out[i] = strconv.FormatUint(id, 10)
+	}
+	return out, nil
 }
 
 // ExtractTimestamp extracts the timestamp from a Snowflake ID and returns it as a time.Time.
@@ -505,4 +530,28 @@ func DecomposeWithEpoch(id uint64, epoch int64) (timestamp time.Time, workerID i
 	}
 
 	return timestamp, workerID, sequence, nil
+}
+
+// ParseString parses a decimal-encoded Snowflake ID string using the default epoch and validates it.
+func ParseString(s string) (uint64, error) {
+	return ParseStringWithEpoch(s, DefaultEpoch)
+}
+
+// ParseStringWithEpoch parses and validates a Snowflake ID string with a custom epoch.
+func ParseStringWithEpoch(s string, epoch int64) (uint64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("%w: empty string", ErrInvalidSnowflakeID)
+	}
+
+	id, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse snowflake: %w", err)
+	}
+
+	if err := ValidateWithEpoch(id, epoch); err != nil {
+		return 0, err
+	}
+
+	return id, nil
 }
