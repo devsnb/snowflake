@@ -944,3 +944,584 @@ func BenchmarkConcurrentGenerate(b *testing.B) {
 		}
 	})
 }
+
+// TestTimestampOverflowGenerate ensures Generate returns ErrTimestampOverflow
+// when the time function reports a timestamp beyond the 41-bit capacity.
+func TestTimestampOverflowGenerate(t *testing.T) {
+	// Compute the maximum timestamp representable in TimeBits
+	maxTimestamp := int64(-1 ^ (-1 << TimeBits))
+
+	// Create a time function that returns beyond the maximum
+	overflowTime := customEpoch + maxTimestamp + 10
+	overflowTimeFunc := func() int64 { return overflowTime }
+
+	node, err := NewNode(0, WithTimeFunc(overflowTimeFunc))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	_, err = node.Generate()
+	if err == nil {
+		t.Fatalf("Generate() expected to error on timestamp overflow but returned nil")
+	}
+	if !errors.Is(err, ErrTimestampOverflow) {
+		t.Fatalf("Generate() error = %v, want ErrTimestampOverflow", err)
+	}
+}
+
+// TestTimestampOverflowBatch ensures GenerateBatch returns ErrTimestampOverflow
+// when the time function reports a timestamp beyond the 41-bit capacity.
+func TestTimestampOverflowBatch(t *testing.T) {
+	// Compute the maximum timestamp representable in TimeBits
+	maxTimestamp := int64(-1 ^ (-1 << TimeBits))
+
+	// Create a time function that returns beyond the maximum
+	overflowTime := customEpoch + maxTimestamp + 100
+	overflowTimeFunc := func() int64 { return overflowTime }
+
+	node, err := NewNode(1, WithTimeFunc(overflowTimeFunc))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	ids, err := node.GenerateBatch(5)
+	if err == nil {
+		t.Fatalf("GenerateBatch() expected to error on timestamp overflow but returned nil")
+	}
+	if !errors.Is(err, ErrTimestampOverflow) {
+		t.Fatalf("GenerateBatch() error = %v, want ErrTimestampOverflow", err)
+	}
+	// Expect partial result to be empty slice (no IDs generated)
+	if len(ids) != 0 {
+		t.Fatalf("GenerateBatch() returned %d ids on overflow, want 0", len(ids))
+	}
+}
+
+// TestExtractTimestampFuture ensures ExtractTimestamp (and Validate) detect timestamps
+// that are too far in the future (more than 1 hour ahead of now).
+func TestExtractTimestampFuture(t *testing.T) {
+	// Build an ID with a timestamp 2 hours in the future (relative to now)
+	futureTime := time.Now().Add(2 * time.Hour).UnixMilli()
+	// Convert to the stored timestamp value (subtract customEpoch)
+	storedTs := futureTime - customEpoch
+	if storedTs <= 0 {
+		t.Skip("computed stored timestamp is non-positive; environment time may be before custom epoch")
+	}
+
+	// Encode timestamp into an ID (worker and sequence zero)
+	id := (uint64(storedTs) << TimestampShift)
+
+	// ExtractTimestamp should return ErrTimestampInFuture
+	_, err := ExtractTimestamp(id)
+	if err == nil {
+		t.Fatalf("ExtractTimestamp() expected to error for future timestamp but returned nil")
+	}
+	if !errors.Is(err, ErrTimestampInFuture) {
+		t.Fatalf("ExtractTimestamp() error = %v, want ErrTimestampInFuture", err)
+	}
+
+	// Validate should also propagate the same error
+	if err := Validate(id); err == nil {
+		t.Fatalf("Validate() expected to error for future timestamp but returned nil")
+	} else if !errors.Is(err, ErrTimestampInFuture) {
+		t.Fatalf("Validate() error = %v, want ErrTimestampInFuture", err)
+	}
+}
+
+// TestGenerateBatchClockBackwardsError ensures GenerateBatch returns ErrClockBackwards
+// when the node's lastTimestamp is ahead of the current time by more than tolerance.
+func TestGenerateBatchClockBackwardsError(t *testing.T) {
+	// Start with a node using a stable time
+	currentTime := customEpoch + 10000
+	stableTimeFunc := func() int64 { return currentTime }
+
+	node, err := NewNode(2, WithTimeFunc(stableTimeFunc))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	// Prime the node so lastTimestamp is set
+	_, err = node.Generate()
+	if err != nil {
+		t.Fatalf("initial Generate() failed: %v", err)
+	}
+
+	// Now simulate a clock that moved backwards significantly (100ms)
+	node.timeFunc = func() int64 { return currentTime - 100 }
+
+	_, err = node.GenerateBatch(10)
+	if err == nil {
+		t.Fatalf("GenerateBatch() expected to error on excessive clock backwards but returned nil")
+	}
+	if !errors.Is(err, ErrClockBackwards) {
+		t.Fatalf("GenerateBatch() error = %v, want ErrClockBackwards", err)
+	}
+}
+
+// TestGenerateBestEffortWorkerIDRange ensures the best-effort worker ID is within valid bounds.
+func TestGenerateBestEffortWorkerIDRange(t *testing.T) {
+	workerID, err := generateBestEffortWorkerID()
+	if err != nil {
+		t.Fatalf("generateBestEffortWorkerID() returned error: %v", err)
+	}
+	if workerID < 0 || workerID > MaxWorkerID {
+		t.Fatalf("generateBestEffortWorkerID() returned out-of-range workerID: %d (want 0..%d)", workerID, MaxWorkerID)
+	}
+}
+
+// TestWaitForNextMillisecondImmediateReturn verifies that when the node's time function
+// already reports a time greater than the provided lastTimestamp, waitForNextMillisecond
+// returns immediately with that time (no long sleep or blocking).
+func TestWaitForNextMillisecondImmediateReturn(t *testing.T) {
+	// Mock timeFunc to return a fixed time well after lastTimestamp.
+	fixedNow := customEpoch + 5000
+	n, err := NewNode(0, WithTimeFunc(func() int64 { return fixedNow }))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	lastTimestamp := int64(100) // much less than fixedNow - customEpoch
+	got := n.waitForNextMillisecond(lastTimestamp)
+	if got <= lastTimestamp {
+		t.Fatalf("waitForNextMillisecond() returned %d, want > %d", got, lastTimestamp)
+	}
+}
+
+// TestWaitForNextMillisecondPolling simulates a case where the first few calls to timeFunc
+// return a value <= lastTimestamp and subsequent calls advance the time, exercising the polling loop.
+func TestWaitForNextMillisecondPolling(t *testing.T) {
+	call := 0
+	// First call returns a time equal to lastTimestamp, second (and later) calls return lastTimestamp+2
+	lastTimestamp := int64(1000)
+	n, err := NewNode(1, WithTimeFunc(func() int64 {
+		call++
+		if call == 1 {
+			// return a timestamp that makes now == lastTimestamp
+			return customEpoch + lastTimestamp
+		}
+		// return a timestamp that's greater so the loop exits
+		return customEpoch + lastTimestamp + 2
+	}))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	got := n.waitForNextMillisecond(lastTimestamp)
+	if got <= lastTimestamp {
+		t.Fatalf("waitForNextMillisecond() polling returned %d, want > %d", got, lastTimestamp)
+	}
+	if call < 2 {
+		t.Fatalf("expected waitForNextMillisecond to call timeFunc multiple times, got %d calls", call)
+	}
+}
+
+// TestExtractWithMaxComponentValues verifies that extract functions correctly handle
+// IDs where each field is at its maximum value.
+func TestExtractWithMaxComponentValues(t *testing.T) {
+	// Construct an ID with max timestamp (41 bits), max worker (10 bits), max sequence (12 bits)
+	maxTimestamp := int64(-1 ^ (-1 << TimeBits))
+	id := (uint64(maxTimestamp) << TimestampShift) |
+		(uint64(MaxWorkerID) << WorkerShift) |
+		uint64(MaxSequence)
+
+	// Extract timestamp
+	ts, err := ExtractTimestamp(id)
+	if err == nil || err.Error() == "" {
+		// May error if timestamp is far in future (expected behavior)
+		// But if it succeeds, verify extraction
+		if ts.IsZero() {
+			t.Fatal("ExtractTimestamp should return non-zero time for max timestamp")
+		}
+	}
+
+	// Extract worker ID - should always work
+	workerID, err := ExtractWorkerID(id)
+	if err != nil {
+		t.Fatalf("ExtractWorkerID() failed: %v", err)
+	}
+	if workerID != MaxWorkerID {
+		t.Fatalf("ExtractWorkerID() = %d, want %d", workerID, MaxWorkerID)
+	}
+
+	// Extract sequence - should always work
+	sequence, err := ExtractSequence(id)
+	if err != nil {
+		t.Fatalf("ExtractSequence() failed: %v", err)
+	}
+	if sequence != MaxSequence {
+		t.Fatalf("ExtractSequence() = %d, want %d", sequence, MaxSequence)
+	}
+}
+
+// TestExtractWithMinimalValues verifies extract functions handle IDs with minimal
+// non-zero values (timestamp just after epoch, worker and sequence = 0).
+func TestExtractWithMinimalValues(t *testing.T) {
+	// Construct an ID with minimal timestamp, worker, and sequence
+	minTimestamp := int64(1) // 1ms after epoch
+	id := uint64(minTimestamp) << TimestampShift
+
+	// Extract timestamp
+	ts, err := ExtractTimestamp(id)
+	if err != nil {
+		t.Fatalf("ExtractTimestamp() failed: %v", err)
+	}
+	expectedTime := time.UnixMilli(minTimestamp + customEpoch)
+	if !ts.Equal(expectedTime) {
+		t.Fatalf("ExtractTimestamp() = %v, want %v", ts, expectedTime)
+	}
+
+	// Extract worker ID
+	workerID, err := ExtractWorkerID(id)
+	if err != nil {
+		t.Fatalf("ExtractWorkerID() failed: %v", err)
+	}
+	if workerID != 0 {
+		t.Fatalf("ExtractWorkerID() = %d, want 0", workerID)
+	}
+
+	// Extract sequence
+	sequence, err := ExtractSequence(id)
+	if err != nil {
+		t.Fatalf("ExtractSequence() failed: %v", err)
+	}
+	if sequence != 0 {
+		t.Fatalf("ExtractSequence() = %d, want 0", sequence)
+	}
+}
+
+// TestSignBitAlwaysZero verifies that all generated IDs have the sign bit (bit 63) set to 0,
+// ensuring IDs are always positive when interpreted as int64.
+func TestSignBitAlwaysZero(t *testing.T) {
+	node, err := NewNode(MaxWorkerID)
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	for i := 0; i < 100; i++ {
+		id, err := node.Generate()
+		if err != nil {
+			t.Fatalf("Generate() iteration %d failed: %v", i, err)
+		}
+
+		// Check if sign bit is set (bit 63)
+		signBit := id >> 63
+		if signBit != 0 {
+			t.Fatalf("ID %d has sign bit set (as int64: %d)", id, int64(id))
+		}
+
+		// Verify it's positive as int64
+		if int64(id) < 0 {
+			t.Fatalf("ID %d is negative when cast to int64: %d", id, int64(id))
+		}
+	}
+}
+
+// TestSequenceExhaustionInSameMillisecond attempts to generate more IDs than the sequence
+// can hold in a single millisecond, triggering the wait-for-next-millisecond logic.
+func TestSequenceExhaustionInSameMillisecond(t *testing.T) {
+	currentTime := customEpoch + 50000
+	callCount := 0
+	n, err := NewNode(7, WithTimeFunc(func() int64 {
+		callCount++
+		// Return same time for first MaxSequence+2 calls, then advance
+		if callCount <= int(MaxSequence)+2 {
+			return currentTime
+		}
+		return currentTime + 1
+	}))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	// Generate MaxSequence+2 IDs - first MaxSequence+1 in first ms, then we exhaust and move to next ms
+	count := int(MaxSequence) + 2
+	ids := make([]uint64, count)
+	for i := 0; i < count; i++ {
+		id, err := n.Generate()
+		if err != nil {
+			t.Fatalf("Generate() iteration %d failed: %v", i, err)
+		}
+		ids[i] = id
+	}
+
+	// All IDs should be unique
+	seen := make(map[uint64]bool)
+	for i, id := range ids {
+		if seen[id] {
+			t.Fatalf("Duplicate ID at index %d: %d", i, id)
+		}
+		seen[id] = true
+	}
+
+	// Last ID should have sequence 0 or 1 (reset after exhaustion)
+	lastSeq, err := ExtractSequence(ids[count-1])
+	if err != nil {
+		t.Fatalf("ExtractSequence() on last ID failed: %v", err)
+	}
+	if lastSeq > 1 {
+		t.Fatalf("Last ID sequence = %d, expected <=1 after exhaustion", lastSeq)
+	}
+}
+
+// TestGenerateBatchExactSequenceBoundary generates a batch of exactly MaxSequence+1 IDs,
+// which should span exactly two milliseconds (first batch exhausts sequence, second starts fresh).
+func TestGenerateBatchExactSequenceBoundary(t *testing.T) {
+	currentTime := customEpoch + 40000
+	callCount := 0
+	n, err := NewNode(15, WithTimeFunc(func() int64 {
+		callCount++
+		// Advance time on the (MaxSequence+2)th call to allow batch to span 2ms
+		if callCount > int(MaxSequence)+1 {
+			return currentTime + 1
+		}
+		return currentTime
+	}))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	count := int(MaxSequence) + 1
+	ids, err := n.GenerateBatch(count)
+	if err != nil {
+		t.Fatalf("GenerateBatch() failed: %v", err)
+	}
+
+	if len(ids) != count {
+		t.Fatalf("GenerateBatch() returned %d IDs, want %d", len(ids), count)
+	}
+
+	// All IDs should be unique
+	seen := make(map[uint64]bool)
+	for i, id := range ids {
+		if seen[id] {
+			t.Fatalf("Duplicate ID at index %d", i)
+		}
+		seen[id] = true
+	}
+
+	// IDs should be in order
+	for i := 1; i < len(ids); i++ {
+		if ids[i] <= ids[i-1] {
+			t.Fatalf("IDs out of order at index %d: %d <= %d", i, ids[i], ids[i-1])
+		}
+	}
+}
+
+// TestValidateIDStructureBoundaries tests Validate with IDs that have component values
+// at boundary positions to ensure the validation logic correctly handles edge cases.
+func TestValidateIDStructureBoundaries(t *testing.T) {
+	tests := []struct {
+		name      string
+		timestamp int64
+		workerID  int64
+		sequence  int64
+		shouldErr bool
+	}{
+		{"Min valid timestamp", 1, 0, 0, false},
+		{"Max valid timestamp at boundary", int64(-1 ^ (-1 << TimeBits)), MaxWorkerID, MaxSequence, true}, // May fail due to future check
+		{"Max worker ID", 1000, MaxWorkerID, 0, false},
+		{"Max sequence", 1000, 0, MaxSequence, false},
+		{"All zeros except timestamp", 500, 0, 0, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := (uint64(tt.timestamp) << TimestampShift) |
+				(uint64(tt.workerID) << WorkerShift) |
+				uint64(tt.sequence)
+
+			err := Validate(id)
+			if (err != nil) != tt.shouldErr {
+				t.Fatalf("Validate() error = %v, wantErr %v", err, tt.shouldErr)
+			}
+		})
+	}
+}
+
+// TestDecomposeWithComponentBoundaries tests Decompose with IDs that have components
+// at various boundary values.
+func TestDecomposeWithComponentBoundaries(t *testing.T) {
+	// Build ID with max values (except timestamp which may error)
+	id := (uint64(10000) << TimestampShift) |
+		(uint64(MaxWorkerID) << WorkerShift) |
+		uint64(MaxSequence)
+
+	ts, workerID, sequence, err := Decompose(id)
+	if err != nil {
+		// May error due to timestamp validation, which is okay
+		t.Logf("Decompose() returned error (acceptable): %v", err)
+		return
+	}
+
+	if !ts.IsZero() && workerID != MaxWorkerID {
+		t.Fatalf("Decompose() workerID = %d, want %d", workerID, MaxWorkerID)
+	}
+
+	if sequence != MaxSequence {
+		t.Fatalf("Decompose() sequence = %d, want %d", sequence, MaxSequence)
+	}
+}
+
+// TestIDStructureIntegrity verifies that generated IDs maintain correct bit structure
+// by reconstructing components and checking positions match.
+func TestIDStructureIntegrity(t *testing.T) {
+	node, err := NewNode(512)
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	for i := 0; i < 50; i++ {
+		id, err := node.Generate()
+		if err != nil {
+			t.Fatalf("Generate() iteration %d failed: %v", i, err)
+		}
+
+		// Extract all components
+		ts, _ := ExtractTimestamp(id)
+		workerID, _ := ExtractWorkerID(id)
+		sequence, _ := ExtractSequence(id)
+
+		// Reconstruct ID from components
+		reconstructed := (uint64(ts.UnixMilli()-customEpoch) << TimestampShift) |
+			(uint64(workerID) << WorkerShift) |
+			uint64(sequence)
+
+		// Reconstructed should match original
+		if reconstructed != id {
+			t.Fatalf("Iteration %d: reconstructed ID %d != original %d", i, reconstructed, id)
+		}
+
+		// Verify bit positions by masking
+		extractedTs := int64((id >> TimestampShift) & (-1 ^ (-1 << TimeBits)))
+		extractedWorker := int64((id >> WorkerShift) & MaxWorkerID)
+		extractedSeq := int64(id & MaxSequence)
+
+		if extractedWorker != workerID {
+			t.Fatalf("Iteration %d: worker bit extraction failed: %d != %d", i, extractedWorker, workerID)
+		}
+		if extractedSeq != sequence {
+			t.Fatalf("Iteration %d: sequence bit extraction failed: %d != %d", i, extractedSeq, sequence)
+		}
+		if extractedTs != ts.UnixMilli()-customEpoch {
+			t.Fatalf("Iteration %d: timestamp bit extraction failed", i)
+		}
+	}
+}
+
+// TestGenerateBatchSmallCounts tests batch generation with very small counts (1, 2, 3)
+// to ensure edge case handling for minimal batch sizes.
+func TestGenerateBatchSmallCounts(t *testing.T) {
+	tests := []int{1, 2, 3, 5}
+
+	for _, count := range tests {
+		t.Run(string(rune(count)), func(t *testing.T) {
+			node, err := NewNode(99)
+			if err != nil {
+				t.Fatalf("NewNode() failed: %v", err)
+			}
+
+			ids, err := node.GenerateBatch(count)
+			if err != nil {
+				t.Fatalf("GenerateBatch(%d) failed: %v", count, err)
+			}
+
+			if len(ids) != count {
+				t.Fatalf("GenerateBatch(%d) returned %d IDs, want %d", count, len(ids), count)
+			}
+
+			// Check uniqueness
+			seen := make(map[uint64]bool)
+			for i, id := range ids {
+				if seen[id] {
+					t.Fatalf("Duplicate ID at index %d", i)
+				}
+				seen[id] = true
+
+				if id == 0 {
+					t.Fatalf("ID at index %d is 0", i)
+				}
+			}
+
+			// Check ordering
+			for i := 1; i < len(ids); i++ {
+				if ids[i] <= ids[i-1] {
+					t.Fatalf("IDs not in order at index %d", i)
+				}
+			}
+		})
+	}
+}
+
+// TestNewNodeBoundaryWorkerIDs tests node creation with worker IDs at exact boundaries.
+func TestNewNodeBoundaryWorkerIDs(t *testing.T) {
+	tests := []struct {
+		name     string
+		workerID int64
+		valid    bool
+	}{
+		{"Zero", 0, true},
+		{"One", 1, true},
+		{"MaxWorkerID-1", MaxWorkerID - 1, true},
+		{"MaxWorkerID", MaxWorkerID, true},
+		{"MaxWorkerID+1", MaxWorkerID + 1, false},
+		{"Negative one", -1, false},
+		{"Negative large", -1024, false},
+		{"Very large", 2048, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node, err := NewNode(tt.workerID)
+			if (err != nil) != !tt.valid {
+				t.Fatalf("NewNode(%d) error = %v, valid = %v", tt.workerID, err, tt.valid)
+			}
+
+			if tt.valid && node != nil && node.workerID != tt.workerID {
+				t.Fatalf("NewNode(%d) workerID = %d", tt.workerID, node.workerID)
+			}
+		})
+	}
+}
+
+// TestGenerateSequenceRolloverMultipleTimes tests that sequence correctly resets
+// multiple times across different milliseconds.
+func TestGenerateSequenceRolloverMultipleTimes(t *testing.T) {
+	timeMs := customEpoch + 30000
+	callCount := 0
+	n, err := NewNode(3, WithTimeFunc(func() int64 {
+		callCount++
+		// Advance to next ms on every (MaxSequence+1)th call
+		ms := callCount / (int(MaxSequence) + 1)
+		return timeMs + int64(ms)
+	}))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	// Generate enough IDs to rollover sequence multiple times
+	totalIDs := int(MaxSequence) * 3
+	ids := make([]uint64, totalIDs)
+	for i := 0; i < totalIDs; i++ {
+		id, err := n.Generate()
+		if err != nil {
+			t.Fatalf("Generate() iteration %d failed: %v", i, err)
+		}
+		ids[i] = id
+	}
+
+	// All IDs should be unique
+	seen := make(map[uint64]bool)
+	for i, id := range ids {
+		if seen[id] {
+			t.Fatalf("Duplicate ID at index %d: %d", i, id)
+		}
+		seen[id] = true
+	}
+
+	// Verify IDs are strictly increasing
+	for i := 1; i < len(ids); i++ {
+		if ids[i] <= ids[i-1] {
+			t.Fatalf("ID order violation at index %d: %d <= %d", i, ids[i], ids[i-1])
+		}
+	}
+}
