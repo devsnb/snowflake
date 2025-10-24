@@ -33,7 +33,7 @@ const (
 	TimestampShift = WorkerBits + SequenceBits
 
 	// Clock drift tolerance (5ms should handle most NTP adjustments)
-	maxBackwardDrift = 5 * time.Millisecond
+	defaultMaxBackwardDrift = 5 * time.Millisecond
 
 	// Maximum timestamp value that fits in TimeBits (41 bits = ~69 years)
 	maxTimestamp = int64(-1 ^ (-1 << TimeBits)) // 2199023255551
@@ -59,10 +59,11 @@ type Node struct {
 	// state packs timestamp (upper 52 bits) and sequence (lower 12 bits) into a single atomic value
 	// This enables lock-free Compare-And-Swap operations
 	// Layout: [timestamp:52][sequence:12]
-	state    atomic.Uint64
-	workerID int64
-	timeFunc func() int64
-	epoch    int64
+	state            atomic.Uint64
+	workerID         int64
+	timeFunc         func() int64
+	epoch            int64
+	maxBackwardDrift time.Duration
 }
 
 // NodeOption defines function signature for node options
@@ -83,9 +84,10 @@ func NewNode(workerID int64, opts ...NodeOption) (*Node, error) {
 	}
 
 	node := &Node{
-		workerID: workerID,
-		timeFunc: func() int64 { return time.Now().UnixMilli() },
-		epoch:    DefaultEpoch,
+		workerID:         workerID,
+		timeFunc:         func() int64 { return time.Now().UnixMilli() },
+		epoch:            DefaultEpoch,
+		maxBackwardDrift: defaultMaxBackwardDrift,
 	}
 
 	for _, opt := range opts {
@@ -100,6 +102,10 @@ func NewNode(workerID int64, opts ...NodeOption) (*Node, error) {
 		return nil, fmt.Errorf("epoch must be non-negative, got %d", node.epoch)
 	}
 
+	if node.maxBackwardDrift < 0 {
+		return nil, fmt.Errorf("clock drift tolerance must be non-negative, got %s", node.maxBackwardDrift)
+	}
+
 	return node, nil
 }
 
@@ -108,6 +114,14 @@ func NewNode(workerID int64, opts ...NodeOption) (*Node, error) {
 func WithEpoch(epoch int64) NodeOption {
 	return func(n *Node) {
 		n.epoch = epoch
+	}
+}
+
+// WithClockDriftTolerance overrides the maximum tolerated backwards clock drift.
+// A zero duration disables tolerance (any backwards movement errors). Must be non-negative.
+func WithClockDriftTolerance(d time.Duration) NodeOption {
+	return func(n *Node) {
+		n.maxBackwardDrift = d
 	}
 }
 
@@ -210,13 +224,13 @@ func (n *Node) Generate() (uint64, error) {
 			drift := oldTs - now
 			driftDuration := time.Duration(drift) * time.Millisecond
 
-			if driftDuration <= maxBackwardDrift {
+			if driftDuration <= n.maxBackwardDrift {
 				// Sleep and retry
 				time.Sleep(driftDuration + time.Millisecond)
 				continue
 			}
 			return 0, fmt.Errorf("%w: drift of %dms exceeds max %dms",
-				ErrClockBackwards, drift, maxBackwardDrift.Milliseconds())
+				ErrClockBackwards, drift, n.maxBackwardDrift.Milliseconds())
 		}
 
 		var newSeq uint64
@@ -302,12 +316,12 @@ func (n *Node) GenerateBatch(count int) ([]uint64, error) {
 			drift := oldTs - now
 			driftDuration := time.Duration(drift) * time.Millisecond
 
-			if driftDuration <= maxBackwardDrift {
+			if driftDuration <= n.maxBackwardDrift {
 				time.Sleep(driftDuration + time.Millisecond)
 				continue
 			}
 			return nil, fmt.Errorf("%w: drift of %dms exceeds max %dms",
-				ErrClockBackwards, drift, maxBackwardDrift.Milliseconds())
+				ErrClockBackwards, drift, n.maxBackwardDrift.Milliseconds())
 		}
 
 		// Calculate how many IDs we can reserve in this millisecond

@@ -340,6 +340,78 @@ func TestGenerateClockBackwardsExcessive(t *testing.T) {
 	}
 }
 
+// TestGenerateClockBackwardsCustomTolerance ensures configurable tolerance allows larger drift.
+func TestGenerateClockBackwardsCustomTolerance(t *testing.T) {
+	currentTime := DefaultEpoch + 20000
+	call := 0
+	mockTimeFunc := func() int64 {
+		call++
+		switch call {
+		case 1:
+			return currentTime
+		case 2:
+			return currentTime - 8 // 8ms backwards but within custom 10ms tolerance
+		default:
+			return currentTime + int64(call*5)
+		}
+	}
+
+	node, err := NewNode(0, WithClockDriftTolerance(10*time.Millisecond), WithTimeFunc(mockTimeFunc))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	id1, err := node.Generate()
+	if err != nil {
+		t.Fatalf("Generate() first call failed: %v", err)
+	}
+
+	id2, err := node.Generate()
+	if err != nil {
+		t.Fatalf("Generate() second call failed with custom tolerance: %v", err)
+	}
+
+	if id2 <= id1 {
+		t.Fatalf("expected id2 > id1 with custom tolerance recovery, got %d <= %d", id2, id1)
+	}
+}
+
+// TestGenerateClockBackwardsZeroTolerance ensures zero tolerance surfaces immediate errors.
+func TestGenerateClockBackwardsZeroTolerance(t *testing.T) {
+	currentTime := DefaultEpoch + 15000
+	call := 0
+	mockTimeFunc := func() int64 {
+		call++
+		if call == 1 {
+			return currentTime
+		}
+		return currentTime - 1 // 1ms backwards should fail when tolerance is zero
+	}
+
+	node, err := NewNode(0, WithClockDriftTolerance(0), WithTimeFunc(mockTimeFunc))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	if _, err := node.Generate(); err != nil {
+		t.Fatalf("Generate() first call failed: %v", err)
+	}
+
+	if _, err := node.Generate(); err == nil {
+		t.Fatal("Generate() expected to error with zero tolerance")
+	} else if !errors.Is(err, ErrClockBackwards) {
+		t.Fatalf("Generate() error = %v, want ErrClockBackwards", err)
+	}
+}
+
+// TestWithClockDriftToleranceNegative ensures negative tolerance is rejected during configuration.
+func TestWithClockDriftToleranceNegative(t *testing.T) {
+	_, err := NewNode(0, WithClockDriftTolerance(-1*time.Millisecond))
+	if err == nil {
+		t.Fatal("NewNode() expected error for negative clock drift tolerance")
+	}
+}
+
 // TestGenerateBeforeEpoch ensures we surface ErrTimeBeforeEpoch when the clock is before the configured epoch.
 func TestGenerateBeforeEpoch(t *testing.T) {
 	node, err := NewNode(1, WithTimeFunc(func() int64 { return DefaultEpoch - 1 }))
