@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -58,15 +57,12 @@ var (
 // Node represents a Snowflake ID generator node.
 // Uses lock-free atomic operations for high-performance ID generation.
 type Node struct {
-	// state packs timestamp (upper 52 bits) and sequence (lower 12 bits) into a single atomic value
-	// This enables lock-free Compare-And-Swap operations
-	// Layout: [timestamp:52][sequence:12]
 	state            atomic.Uint64
 	workerID         int64
 	workerBits       uint64
 	timeFunc         func() int64
 	epoch            int64
-	maxBackwardDrift time.Duration
+	maxBackwardDrift int64 // Stored as milliseconds to avoid Duration conversion in hot path
 }
 
 // NodeOption defines function signature for node options
@@ -91,7 +87,7 @@ func NewNode(workerID int64, opts ...NodeOption) (*Node, error) {
 		workerBits:       uint64(workerID) << WorkerShift,
 		timeFunc:         func() int64 { return time.Now().UnixMilli() },
 		epoch:            DefaultEpoch,
-		maxBackwardDrift: defaultMaxBackwardDrift,
+		maxBackwardDrift: int64(defaultMaxBackwardDrift / time.Millisecond),
 	}
 
 	for _, opt := range opts {
@@ -107,7 +103,7 @@ func NewNode(workerID int64, opts ...NodeOption) (*Node, error) {
 	}
 
 	if node.maxBackwardDrift < 0 {
-		return nil, fmt.Errorf("clock drift tolerance must be non-negative, got %s", node.maxBackwardDrift)
+		return nil, fmt.Errorf("clock drift tolerance must be non-negative, got %d", node.maxBackwardDrift)
 	}
 
 	return node, nil
@@ -125,7 +121,7 @@ func WithEpoch(epoch int64) NodeOption {
 // A zero duration disables tolerance (any backwards movement errors). Must be non-negative.
 func WithClockDriftTolerance(d time.Duration) NodeOption {
 	return func(n *Node) {
-		n.maxBackwardDrift = d
+		n.maxBackwardDrift = int64(d / time.Millisecond)
 	}
 }
 
@@ -192,97 +188,65 @@ func generateBestEffortWorkerID() (int64, error) {
 	return workerID, nil
 }
 
-// waitForNextMillisecond uses a hybrid approach: sleep most of the way, then poll
-// This avoids CPU burn while ensuring we don't under-sleep due to timer granularity
-// Generate generates a new unique Snowflake ID using lock-free atomic operations.
-// The returned ID follows the standard Twitter Snowflake format:
-// - Bit 63: Sign bit (always 0)
-// - Bits 62-22: Timestamp in milliseconds since the configured epoch (41 bits)
-// - Bits 21-12: Worker ID (10 bits)
-// - Bits 11-0: Sequence number (12 bits)
-//
-// This implementation uses Compare-And-Swap (CAS) for lock-free concurrency,
-// providing excellent performance under high contention.
+// Generate creates a new Snowflake ID.
+// It handles clock drift, sequence overflow, and ensures uniqueness.
+// The implementation is optimized for minimal allocations and reduced branching.
 func (n *Node) Generate() (uint64, error) {
 	for {
-		// Load current state atomically
 		oldState := n.state.Load()
-		oldSeq := oldState & uint64(MaxSequence) // Extract lower 12 bits (sequence)
-		oldTs := int64(oldState >> SequenceBits) // Extract upper 52 bits (timestamp)
+		oldSeq := oldState & uint64(MaxSequence)
+		oldTs := int64(oldState >> SequenceBits)
 
-		nowAbsolute := n.timeFunc()
-		now := nowAbsolute - n.epoch
+		// Single time call with epoch subtraction
+		now := n.timeFunc() - n.epoch
 
 		if now < 0 {
-			return 0, fmt.Errorf("%w: now=%d epoch=%d", ErrTimeBeforeEpoch, nowAbsolute, n.epoch)
+			return 0, ErrTimeBeforeEpoch
 		}
 
-		// Check for timestamp overflow
 		if now > maxTimestamp {
-			return 0, fmt.Errorf("%w: timestamp %d exceeds maximum %d",
-				ErrTimestampOverflow, now, maxTimestamp)
+			return 0, ErrTimestampOverflow
 		}
 
-		// Handle clock moving backwards
+		// Drift detection using direct int64 comparison
 		if now < oldTs {
 			drift := oldTs - now
-			driftDuration := time.Duration(drift) * time.Millisecond
-
-			if driftDuration <= n.maxBackwardDrift {
-				// Sleep and retry
-				time.Sleep(driftDuration + time.Millisecond)
-				continue
+			if drift > n.maxBackwardDrift {
+				return 0, ErrClockBackwards
 			}
-			return 0, fmt.Errorf("%w: drift of %dms exceeds max %dms",
-				ErrClockBackwards, drift, n.maxBackwardDrift.Milliseconds())
+			// Sleep slightly longer than the drift
+			time.Sleep(time.Duration(drift+1) * time.Millisecond)
+			continue
 		}
 
-		var newSeq uint64
-		var newTs int64
 		var newState uint64
-		var tsBits uint64
 
 		if now == oldTs {
 			// Same millisecond - increment sequence
-			newSeq = (oldSeq + 1) & uint64(MaxSequence)
-			if newSeq == 0 {
-				// Sequence exhausted - wait for the next millisecond
-				for {
-					nowAbsolute = n.timeFunc()
-					now = nowAbsolute - n.epoch
+			if oldSeq == uint64(MaxSequence) {
+				// Tight spin loop for sequence exhaustion (waits for next millisecond)
+				for now <= oldTs {
+					now = n.timeFunc() - n.epoch
 					if now < 0 {
-						return 0, fmt.Errorf("%w: now=%d epoch=%d", ErrTimeBeforeEpoch, nowAbsolute, n.epoch)
+						return 0, ErrTimeBeforeEpoch
 					}
-					if now > oldTs {
-						break
-					}
-					time.Sleep(50 * time.Microsecond)
-					runtime.Gosched()
 				}
 				continue
 			}
-			newTs = oldTs
 			newState = oldState + 1
-			tsBits = uint64(newTs) << TimestampShift
 		} else {
-			// New millisecond - reset sequence
-			newSeq = 0
-			newTs = now
-			newState = (uint64(newTs) << SequenceBits)
-			tsBits = uint64(newTs) << TimestampShift
+			// New millisecond - reset sequence to 0
+			newState = uint64(now) << SequenceBits
 		}
 
-		if now != oldTs {
-			newState |= newSeq
-		}
-
-		// Try to update state atomically
+		// Try CAS
 		if n.state.CompareAndSwap(oldState, newState) {
-			// Success! Build and return the ID
-			id := tsBits | n.workerBits | newSeq
-			return id, nil
+			// Construct ID directly from packed state without intermediate variables
+			seq := newState & uint64(MaxSequence)
+			ts := newState >> SequenceBits
+			return (ts << TimestampShift) | n.workerBits | seq, nil
 		}
-		// CAS failed - another goroutine updated state, retry
+		// CAS failed, retry
 	}
 }
 
@@ -316,94 +280,85 @@ func (n *Node) GenerateBatch(count int) ([]uint64, error) {
 		oldSeq := oldState & uint64(MaxSequence)
 		oldTs := int64(oldState >> SequenceBits)
 
-		nowAbsolute := n.timeFunc()
-		now := nowAbsolute - n.epoch
+		now := n.timeFunc() - n.epoch
 
 		if now < 0 {
-			return nil, fmt.Errorf("%w: now=%d epoch=%d", ErrTimeBeforeEpoch, nowAbsolute, n.epoch)
+			return nil, ErrTimeBeforeEpoch
 		}
 
-		// Check for timestamp overflow
 		if now > maxTimestamp {
-			return nil, fmt.Errorf("%w: timestamp %d exceeds maximum %d",
-				ErrTimestampOverflow, now, maxTimestamp)
+			return nil, ErrTimestampOverflow
 		}
 
 		// Handle clock moving backwards
 		if now < oldTs {
 			drift := oldTs - now
-			driftDuration := time.Duration(drift) * time.Millisecond
-
-			if driftDuration <= n.maxBackwardDrift {
-				time.Sleep(driftDuration + time.Millisecond)
-				continue
+			if drift > n.maxBackwardDrift {
+				return nil, ErrClockBackwards
 			}
-			return nil, fmt.Errorf("%w: drift of %dms exceeds max %dms",
-				ErrClockBackwards, drift, n.maxBackwardDrift.Milliseconds())
+			time.Sleep(time.Duration(drift+1) * time.Millisecond)
+			continue
 		}
 
-		// Calculate how many IDs we can reserve in this millisecond
+		// Calculate how many IDs we can reserve
 		var available int
 		var startSeq uint64
 		var useTs int64
+		var newState uint64
 
-		sameMillisecond := now == oldTs
-		if sameMillisecond {
-			// Same millisecond - reserve from current sequence
+		if now == oldTs {
+			// Same millisecond
 			available = int(uint64(MaxSequence) - oldSeq)
 			if available == 0 {
-				// Sequence exhausted - wait for the next millisecond
-				for {
-					nowAbsolute = n.timeFunc()
-					now = nowAbsolute - n.epoch
+				// Sequence exhausted
+				for now <= oldTs {
+					now = n.timeFunc() - n.epoch
 					if now < 0 {
-						return nil, fmt.Errorf("%w: now=%d epoch=%d", ErrTimeBeforeEpoch, nowAbsolute, n.epoch)
+						return nil, ErrTimeBeforeEpoch
 					}
-					if now > oldTs {
-						break
-					}
-					time.Sleep(50 * time.Microsecond)
-					runtime.Gosched()
 				}
 				continue
 			}
 			startSeq = oldSeq + 1
 			useTs = oldTs
+
+			remaining := count - len(ids)
+			toReserve := remaining
+			if toReserve > available {
+				toReserve = available
+			}
+			newState = oldState + uint64(toReserve)
 		} else {
-			// New millisecond - full range available
+			// New millisecond
 			available = int(MaxSequence) + 1
 			startSeq = 0
 			useTs = now
+
+			remaining := count - len(ids)
+			toReserve := remaining
+			if toReserve > available {
+				toReserve = available
+			}
+			endSeq := startSeq + uint64(toReserve) - 1
+			newState = (uint64(useTs) << SequenceBits) | (endSeq & uint64(MaxSequence))
 		}
 
-		// Reserve as many as we need (or as many as available)
+		// Calculate how many to reserve
 		remaining := count - len(ids)
 		toReserve := remaining
 		if toReserve > available {
 			toReserve = available
 		}
 
-		// Calculate new state after reservation
-		endSeq := startSeq + uint64(toReserve) - 1
-		var newState uint64
-		if sameMillisecond {
-			newState = oldState + uint64(toReserve)
-		} else {
-			newState = (uint64(useTs) << SequenceBits) | (endSeq & uint64(MaxSequence))
-		}
-
-		// Try to reserve the range atomically
+		// Try to reserve atomically
 		if n.state.CompareAndSwap(oldState, newState) {
-			// Successfully reserved range [startSeq, endSeq] in timestamp useTs
-			// Generate IDs from this range
-			tsBits := uint64(useTs) << TimestampShift
-			base := tsBits | n.workerBits
+			// Construct IDs directly in a tight loop, computing base once and combining with sequences
+			base := (uint64(useTs) << TimestampShift) | n.workerBits
 			for i := 0; i < toReserve; i++ {
 				seq := (startSeq + uint64(i)) & uint64(MaxSequence)
 				ids = append(ids, base|seq)
 			}
 		}
-		// If CAS failed, retry (another goroutine updated state)
 	}
 
 	return ids, nil
@@ -416,6 +371,7 @@ func (n *Node) GenerateBatchStrings(count int) ([]string, error) {
 		return nil, err
 	}
 
+	// Pre-allocate the output slice with exact size to avoid reallocation
 	out := make([]string, len(ids))
 	for i, id := range ids {
 		out[i] = strconv.FormatUint(id, 10)
@@ -435,7 +391,8 @@ func ExtractTimestampWithEpoch(id uint64, epoch int64) (time.Time, error) {
 		return time.Time{}, ErrInvalidSnowflakeID
 	}
 
-	timestamp := int64((id >> TimestampShift) & (-1 ^ (-1 << TimeBits)))
+	// Extract timestamp from the upper bits (optimized bit extraction)
+	timestamp := int64(id >> TimestampShift)
 	t := time.UnixMilli(timestamp + epoch)
 
 	// Validate timestamp is not in the far future (allow 1 hour drift)
