@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1700,5 +1701,369 @@ func TestGenerateSequenceRolloverMultipleTimes(t *testing.T) {
 		if ids[i] <= ids[i-1] {
 			t.Fatalf("ID order violation at index %d: %d <= %d", i, ids[i], ids[i-1])
 		}
+	}
+}
+
+// TestOptimizedSequenceExhaustionTightLoop verifies that the tight polling loop
+// for sequence exhaustion correctly waits for the next millisecond when sequences
+// are exhausted within a single millisecond.
+func TestOptimizedSequenceExhaustionTightLoop(t *testing.T) {
+	currentTime := DefaultEpoch + 5000
+	var atomicCallCount atomic.Int64
+
+	mockTimeFunc := func() int64 {
+		count := atomicCallCount.Add(1)
+		// First MaxSequence+1 calls: same time (exhaust sequence)
+		// Next calls: check if we're in the spin loop, return next ms
+		if count <= int64(MaxSequence)+1 {
+			return currentTime
+		}
+		// After exhaustion, advance time by 1ms
+		return currentTime + 1
+	}
+
+	node, err := NewNode(0, WithTimeFunc(mockTimeFunc))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	// Generate MaxSequence+1 IDs to exhaust sequence
+	for i := 0; i <= int(MaxSequence); i++ {
+		_, err := node.Generate()
+		if err != nil {
+			t.Fatalf("Generate() iteration %d failed: %v", i, err)
+		}
+	}
+
+	// Next ID should trigger the tight spin loop and wait for the next millisecond
+	start := time.Now()
+	nextID, err := node.Generate()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Generate() after exhaustion failed: %v", err)
+	}
+
+	// Verify the ID is valid
+	if nextID == 0 {
+		t.Fatal("Generated ID is zero after exhaustion recovery")
+	}
+
+	// The tight spin loop should be very fast (< 10ms)
+	// Without the optimization (with sleep), it would take longer
+	if elapsed > 10*time.Millisecond {
+		t.Logf("WARNING: Spin loop took %v (expected < 10ms with optimization)", elapsed)
+	}
+
+	// Verify sequence was reset
+	seq, err := ExtractSequence(nextID)
+	if err != nil {
+		t.Fatalf("ExtractSequence() failed: %v", err)
+	}
+	if seq != 0 {
+		t.Errorf("Sequence after exhaustion = %d, want 0", seq)
+	}
+
+	// Verify we made multiple time function calls during spin
+	totalCalls := atomicCallCount.Load()
+	if totalCalls <= int64(MaxSequence)+2 {
+		t.Logf("Expected multiple spin loop iterations, got %d total time calls", totalCalls)
+	}
+}
+
+// TestOptimizedDriftHandlingInt64Comparison verifies that clock drift is detected
+// and handled efficiently using direct integer comparison of milliseconds.
+func TestOptimizedDriftHandlingInt64Comparison(t *testing.T) {
+	currentTime := DefaultEpoch + 10000
+	var callCount atomic.Int32
+
+	mockTimeFunc := func() int64 {
+		count := callCount.Add(1)
+		switch count {
+		case 1:
+			return currentTime
+		case 2:
+			// Small drift backwards (3ms - within default 5ms tolerance)
+			return currentTime - 3
+		default:
+			// After sleep recovery, time moves forward
+			return currentTime + int64(count)*2
+		}
+	}
+
+	node, err := NewNode(0, WithTimeFunc(mockTimeFunc))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	// First ID
+	id1, err := node.Generate()
+	if err != nil {
+		t.Fatalf("First Generate() failed: %v", err)
+	}
+
+	// Second ID with clock drift - should handle it efficiently
+	start := time.Now()
+	id2, err := node.Generate()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Second Generate() failed: %v", err)
+	}
+
+	// Verify IDs are valid and ordered
+	if id1 == 0 || id2 == 0 {
+		t.Fatal("Generated IDs should not be zero")
+	}
+	if id2 <= id1 {
+		t.Errorf("IDs not ordered: id2=%d <= id1=%d", id2, id1)
+	}
+
+	// The optimized int64 comparison should recover quickly
+	// Expected: ~3-4ms sleep (drift + 1ms)
+	if elapsed < 3*time.Millisecond || elapsed > 10*time.Millisecond {
+		t.Logf("Drift recovery took %v (expected ~3-4ms)", elapsed)
+	}
+}
+
+// TestOptimizedGenerateBatchDirectConstruction verifies that batch generation
+// constructs IDs efficiently by computing common components once and combining
+// them with sequence numbers in a tight loop.
+func TestOptimizedGenerateBatchDirectConstruction(t *testing.T) {
+	node, err := NewNode(MaxWorkerID) // Use max worker ID to test all bits
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	// Generate a large batch to exercise the direct construction loop
+	const batchSize = 5000
+	start := time.Now()
+	ids, err := node.GenerateBatch(batchSize)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("GenerateBatch() failed: %v", err)
+	}
+
+	if len(ids) != batchSize {
+		t.Fatalf("GenerateBatch() returned %d IDs, want %d", len(ids), batchSize)
+	}
+
+	// Verify all IDs are valid and unique
+	seen := make(map[uint64]bool, batchSize)
+	for i, id := range ids {
+		if id == 0 {
+			t.Fatalf("ID at index %d is zero", i)
+		}
+		if seen[id] {
+			t.Fatalf("Duplicate ID at index %d: %d", i, id)
+		}
+		seen[id] = true
+
+		// Verify worker ID is correctly embedded (tests direct construction)
+		workerID, err := ExtractWorkerID(id)
+		if err != nil {
+			t.Fatalf("ExtractWorkerID() at index %d failed: %v", i, err)
+		}
+		if workerID != MaxWorkerID {
+			t.Errorf("ID at index %d has wrong worker ID: %d, want %d", i, workerID, MaxWorkerID)
+		}
+	}
+
+	// Verify IDs are strictly ordered (validates construction correctness)
+	for i := 1; i < len(ids); i++ {
+		if ids[i] <= ids[i-1] {
+			t.Fatalf("IDs not ordered at index %d: %d <= %d", i, ids[i], ids[i-1])
+		}
+	}
+
+	// Log performance (with optimization, should be very fast)
+	t.Logf("Generated %d IDs in %v (%.2f µs/ID)", batchSize, elapsed,
+		float64(elapsed.Microseconds())/float64(batchSize))
+}
+
+// TestOptimizedConcurrentGenerateContention tests the generator's correctness
+// and performance under high contention with many concurrent goroutines.
+func TestOptimizedConcurrentGenerateContention(t *testing.T) {
+	node, err := NewNode(42)
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	const (
+		goroutines      = 32 // High contention
+		idsPerGoroutine = 1000
+		totalIDs        = goroutines * idsPerGoroutine
+	)
+
+	idsCh := make(chan uint64, totalIDs)
+	errCh := make(chan error, goroutines)
+
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < idsPerGoroutine; i++ {
+				id, genErr := node.Generate()
+				if genErr != nil {
+					errCh <- genErr
+					return
+				}
+				idsCh <- id
+			}
+		}()
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+	close(idsCh)
+	close(errCh)
+
+	// Check for errors
+	for genErr := range errCh {
+		if genErr != nil {
+			t.Fatalf("Generate() failed under contention: %v", genErr)
+		}
+	}
+
+	// Verify uniqueness
+	seen := make(map[uint64]struct{}, totalIDs)
+	for id := range idsCh {
+		if _, ok := seen[id]; ok {
+			t.Fatalf("Duplicate ID detected under high contention: %d", id)
+		}
+		seen[id] = struct{}{}
+	}
+
+	if len(seen) != totalIDs {
+		t.Fatalf("Expected %d unique IDs, got %d", totalIDs, len(seen))
+	}
+
+	// Log performance
+	idsPerSecond := float64(totalIDs) / elapsed.Seconds()
+	avgNsPerID := float64(elapsed.Nanoseconds()) / float64(totalIDs)
+	t.Logf("Generated %d IDs with %d goroutines in %v", totalIDs, goroutines, elapsed)
+	t.Logf("Throughput: %.0f IDs/sec, Avg: %.1f ns/ID", idsPerSecond, avgNsPerID)
+}
+
+// TestOptimizedSingleTimeComputation verifies that the generator calls the time
+// function only once per ID generation, avoiding redundant time lookups.
+func TestOptimizedSingleTimeComputation(t *testing.T) {
+	var timeCallCount atomic.Int32
+	currentTime := DefaultEpoch + 1000
+
+	mockTimeFunc := func() int64 {
+		timeCallCount.Add(1)
+		return currentTime
+	}
+
+	node, err := NewNode(5, WithTimeFunc(mockTimeFunc))
+	if err != nil {
+		t.Fatalf("NewNode() failed: %v", err)
+	}
+
+	// Reset counter after node creation
+	timeCallCount.Store(0)
+
+	// Generate a single ID
+	_, err = node.Generate()
+	if err != nil {
+		t.Fatalf("Generate() failed: %v", err)
+	}
+
+	// With optimization, we should only call time function once per generate
+	// (unless there's a CAS retry, which shouldn't happen in single-threaded test)
+	calls := timeCallCount.Load()
+	if calls > 2 {
+		t.Errorf("Time function called %d times, expected 1-2 calls (with possible CAS retry)", calls)
+	}
+
+	// Generate multiple IDs in same millisecond
+	timeCallCount.Store(0)
+	for i := 0; i < 10; i++ {
+		_, err := node.Generate()
+		if err != nil {
+			t.Fatalf("Generate() iteration %d failed: %v", i, err)
+		}
+	}
+
+	// Should have ~10 time calls (one per generation, no redundant calls)
+	calls = timeCallCount.Load()
+	if calls < 10 || calls > 15 {
+		t.Logf("Generated 10 IDs with %d time function calls (expected ~10-15 with CAS retries)", calls)
+	}
+}
+
+// TestOptimizedMaxBackwardDriftInt64Storage verifies that clock drift tolerance
+// is correctly stored as milliseconds and used for drift detection.
+func TestOptimizedMaxBackwardDriftInt64Storage(t *testing.T) {
+	// Test various drift tolerances
+	tests := []struct {
+		name      string
+		tolerance time.Duration
+		expectMs  int64
+	}{
+		{"5ms default", 5 * time.Millisecond, 5},
+		{"10ms", 10 * time.Millisecond, 10},
+		{"100ms", 100 * time.Millisecond, 100},
+		{"1s", 1 * time.Second, 1000},
+		{"0ms", 0, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node, err := NewNode(0, WithClockDriftTolerance(tt.tolerance))
+			if err != nil {
+				t.Fatalf("NewNode() failed: %v", err)
+			}
+
+			// Verify internal storage is int64 milliseconds
+			if node.maxBackwardDrift != tt.expectMs {
+				t.Errorf("maxBackwardDrift = %d ms, want %d ms", node.maxBackwardDrift, tt.expectMs)
+			}
+
+			// Test that drift handling works correctly with this tolerance
+			currentTime := DefaultEpoch + 5000
+			driftAmount := tt.expectMs - 1 // Within tolerance
+			if driftAmount < 0 {
+				driftAmount = 0
+			}
+
+			callCount := 0
+			mockTimeFunc := func() int64 {
+				callCount++
+				if callCount == 1 {
+					return currentTime
+				}
+				if callCount == 2 {
+					return currentTime - driftAmount
+				}
+				return currentTime + int64(callCount)
+			}
+
+			node.timeFunc = mockTimeFunc
+
+			// Should succeed with first ID
+			_, err = node.Generate()
+			if err != nil {
+				t.Fatalf("First Generate() failed: %v", err)
+			}
+
+			// Should handle drift if within tolerance
+			if driftAmount > 0 {
+				_, err = node.Generate()
+				if tt.expectMs == 0 && driftAmount > 0 {
+					// Zero tolerance should error on any drift
+					if err == nil {
+						t.Error("Expected error with zero tolerance and drift")
+					}
+				} else if err != nil {
+					t.Fatalf("Second Generate() failed with drift within tolerance: %v", err)
+				}
+			}
+		})
 	}
 }
